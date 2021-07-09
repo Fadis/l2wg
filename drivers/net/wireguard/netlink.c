@@ -53,7 +53,7 @@ static struct wg_device *lookup_interface(struct nlattr **attrs,
 					  struct sk_buff *skb)
 {
 	struct net_device *dev = NULL;
-
+	struct wg_device *wg = NULL;
 	if (!attrs[WGDEVICE_A_IFINDEX] == !attrs[WGDEVICE_A_IFNAME])
 		return ERR_PTR(-EBADR);
 	if (attrs[WGDEVICE_A_IFINDEX])
@@ -64,7 +64,15 @@ static struct wg_device *lookup_interface(struct nlattr **attrs,
 				      nla_data(attrs[WGDEVICE_A_IFNAME]));
 	if (!dev)
 		return ERR_PTR(-ENODEV);
-	if (!dev->rtnl_link_ops || !dev->rtnl_link_ops->kind ||
+	wg = netdev_priv(dev);
+	if( wg->l2 ) {
+		if (!dev->rtnl_link_ops || !dev->rtnl_link_ops->kind ||
+	    		strcmp(dev->rtnl_link_ops->kind, "l2" KBUILD_MODNAME)) {
+			dev_put(dev);
+			return ERR_PTR(-EOPNOTSUPP);
+		}
+	}
+	else if (!dev->rtnl_link_ops || !dev->rtnl_link_ops->kind ||
 	    strcmp(dev->rtnl_link_ops->kind, KBUILD_MODNAME)) {
 		dev_put(dev);
 		return ERR_PTR(-EOPNOTSUPP);

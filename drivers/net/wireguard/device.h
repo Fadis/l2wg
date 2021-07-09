@@ -19,6 +19,7 @@
 #include <linux/ptr_ring.h>
 
 struct wg_device;
+struct wg_peer;
 
 struct multicore_worker {
 	void *ptr;
@@ -56,9 +57,20 @@ struct wg_device {
 	unsigned int num_peers, device_update_gen;
 	u32 fwmark;
 	u16 incoming_port;
+	bool l2;
+	struct wg_peer *(*allowedips_lookup_src)(struct allowedips *table,
+					 struct sk_buff *skb);
+	struct wg_peer *(*allowedips_lookup_dst)(struct allowedips *table,
+					 struct sk_buff *skb);
+	bool (*check_packet_length)( struct sk_buff *skb,  struct net_device *dev );
+	unsigned int (*get_packet_length)( struct sk_buff *skb );
 };
 
 int wg_device_init(void);
 void wg_device_uninit(void);
+bool wg_check_packet_length( struct sk_buff *skb,  struct net_device *dev );
+bool l2wg_check_packet_length( struct sk_buff *skb,  struct net_device *dev );
+unsigned int wg_get_packet_length( struct sk_buff *skb );
+unsigned int l2wg_get_packet_length( struct sk_buff *skb );
 
 #endif /* _WG_DEVICE_H */

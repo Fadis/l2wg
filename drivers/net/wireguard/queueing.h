@@ -68,8 +68,14 @@ struct packet_cb {
 
 static inline bool wg_check_packet_protocol(struct sk_buff *skb)
 {
-	__be16 real_protocol = ip_tunnel_parse_protocol(skb);
-	return real_protocol && skb->protocol == real_protocol;
+	if( skb->mac_header == skb->network_header ) {
+		__be16 real_protocol = ip_tunnel_parse_protocol(skb);
+		return real_protocol && skb->protocol == real_protocol;
+	}
+	else {
+		__be16 real_protocol = eth_hdr( skb )->h_proto;
+		return real_protocol && skb->protocol == real_protocol;
+	}
 }
 
 static inline void wg_reset_packet(struct sk_buff *skb, bool encapsulating)

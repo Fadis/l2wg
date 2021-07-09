@@ -14,8 +14,13 @@
 #include <linux/ip.h>
 #include <linux/ipv6.h>
 #include <linux/udp.h>
+#include <linux/atalk.h>
+#include <linux/if_vlan.h>
+#include <linux/if_pppox.h>
 #include <net/ip_tunnels.h>
-
+#include <net/ipx.h>
+#include <net/bond_3ad.h>
+#include <rdma/ib_verbs.h>
 /* Must be called with bh disabled. */
 static void update_rx_stats(struct wg_peer *peer, size_t len)
 {
@@ -338,11 +343,355 @@ out:
 
 #include "selftest/counter.c"
 
+unsigned int wg_get_packet_length(
+	struct sk_buff *skb
+) {
+	unsigned int len;
+	skb->protocol = ip_tunnel_parse_protocol(skb);
+	if (skb->protocol == htons(ETH_P_IP)) {
+		len = ntohs(ip_hdr(skb)->tot_len);
+		if (unlikely(len < sizeof(struct iphdr)))
+			return 0u;
+		INET_ECN_decapsulate(skb, PACKET_CB(skb)->ds, ip_hdr(skb)->tos);
+	} else if (skb->protocol == htons(ETH_P_IPV6)) {
+		len = ntohs(ipv6_hdr(skb)->payload_len) +
+		sizeof(struct ipv6hdr);
+		INET_ECN_decapsulate(skb, PACKET_CB(skb)->ds, ipv6_get_dsfield(ipv6_hdr(skb)));
+	} else {
+		return 0u;
+	}
+	return len;
+}
+
+struct ieee8021ah_hdr {
+	__be32		itag;
+	unsigned char	h_dest[ETH_ALEN];
+	unsigned char	h_source[ETH_ALEN];
+	__be16		h_proto;
+} __attribute__((packed));
+
+struct llc_hdr {
+	unsigned char   dsap;
+	unsigned char   ssap;
+	unsigned char	type;
+} __attribute__((packed));
+
+struct snap_hdr {
+	unsigned char   dsap;
+	unsigned char   ssap;
+	unsigned char	type;
+	unsigned char   control[ 3 ];
+	__be16          h_proto;
+} __attribute__((packed));
+
+
+unsigned int l2wg_get_packet_length(
+	struct sk_buff *skb
+) {
+	unsigned int len;
+	u8 slow_sub_type;
+	u8 *cur;
+	__be16 vlan_protocol;
+	unsigned int tlv_type;
+	unsigned int tlv_length;
+	if (skb->protocol == htons(ETH_P_IP)) {
+		len = ntohs(ip_hdr(skb)->tot_len);
+		if (unlikely(len < sizeof(struct iphdr)))
+			return 0u;
+		INET_ECN_decapsulate(skb, PACKET_CB(skb)->ds, ip_hdr(skb)->tos);
+	} else if (skb->protocol == htons(ETH_P_IPV6)) {
+		len = ntohs(ipv6_hdr(skb)->payload_len) +
+		      sizeof(struct ipv6hdr);
+		INET_ECN_decapsulate(skb, PACKET_CB(skb)->ds, ipv6_get_dsfield(ipv6_hdr(skb)));
+	} else if (skb->protocol == htons(ETH_P_ARP)) {
+		len = sizeof( struct arphdr ) + arp_hdr(skb)->ar_hln * 2 + arp_hdr(skb)->ar_pln * 2;
+	} else if (skb->protocol == htons(ETH_P_RARP)) {
+		len = sizeof( struct arphdr ) + arp_hdr(skb)->ar_hln * 2 + arp_hdr(skb)->ar_pln * 2;
+	} else if (skb->protocol == htons(ETH_P_PAUSE)) {
+		len = 4u; // pause frame always has 4 bytes of length
+	} else if (skb->protocol == htons(ETH_P_ATALK)) {
+		len = ( ntohs( ddp_hdr( skb )->deh_len_hops ) & 0x3FFu );
+	} else if (skb->protocol == htons(ETH_P_AARP)) {
+		len = sizeof( struct elapaarp );
+	} else if (
+		skb->protocol == htons(ETH_P_8021Q) ||
+		skb->protocol == htons(ETH_P_8021AD) ||
+		skb->protocol == htons(ETH_P_QINQ1) ||
+		skb->protocol == htons(ETH_P_QINQ2) ||
+		skb->protocol == htons(ETH_P_QINQ3)
+	) {
+		vlan_protocol = skb->protocol;
+		skb->protocol = ((struct vlan_hdr*)skb_network_header( skb ))->h_vlan_encapsulated_proto;
+		skb->network_header += sizeof( struct vlan_hdr );
+		skb->data += sizeof( struct vlan_hdr );
+		skb->len -= sizeof( struct vlan_hdr );
+		len = l2wg_get_packet_length( skb );
+		skb->network_header -= sizeof( struct vlan_hdr );
+		skb->data -= sizeof( struct vlan_hdr );
+		skb->len += sizeof( struct vlan_hdr );
+		skb->protocol = vlan_protocol;
+		if( unlikely(!len) ) return 0u;
+		len += sizeof( struct vlan_hdr );
+	} else if ( skb->protocol == htons(ETH_P_8021AH) ) {
+		vlan_protocol = skb->protocol;
+		skb->protocol = ((struct ieee8021ah_hdr*)skb_network_header( skb ))->h_proto;
+		skb->network_header += sizeof( struct ieee8021ah_hdr );
+		skb->data += sizeof( struct ieee8021ah_hdr );
+		skb->len -= sizeof( struct ieee8021ah_hdr );
+		len = l2wg_get_packet_length( skb );
+		skb->network_header -= sizeof( struct ieee8021ah_hdr );
+		skb->data -= sizeof( struct ieee8021ah_hdr );
+		skb->len += sizeof( struct ieee8021ah_hdr );
+		skb->protocol = vlan_protocol;
+		if( unlikely(!len) ) return 0u;
+		len += sizeof( struct ieee8021ah_hdr );
+	} else if (skb->protocol == htons(ETH_P_IPX)) {
+		len = ntohs(((struct ipxhdr*)skb_network_header(skb))->ipx_pktsize);
+	} else if (skb->protocol == htons(ETH_P_802_2)) {
+		if(
+		  ((struct llc_hdr*)skb_network_header( skb ))->dsap == 0xaa &&
+		  ((struct llc_hdr*)skb_network_header( skb ))->ssap == 0xaa &&
+		  ((struct llc_hdr*)skb_network_header( skb ))->type == 0x03
+		) {
+			vlan_protocol = skb->protocol;
+			skb->protocol = ((struct snap_hdr*)skb_network_header( skb ))->h_proto;
+			skb->network_header += sizeof( struct snap_hdr );
+			skb->data += sizeof( struct snap_hdr );
+			skb->len -= sizeof( struct snap_hdr );
+			len = l2wg_get_packet_length( skb );
+			skb->network_header -= sizeof( struct snap_hdr );
+			skb->data -= sizeof( struct snap_hdr );
+			skb->len += sizeof( struct snap_hdr );
+			skb->protocol = vlan_protocol;
+			if( unlikely(!len) ) return 0u;
+			len += sizeof( struct snap_hdr );
+		}
+		else return 0u;
+	} else if (skb->protocol == htons(ETH_P_SLOW)) {
+		slow_sub_type = *(u8*)skb_network_header(skb);
+		if ( slow_sub_type == AD_TYPE_LACPDU ) {
+			len = sizeof( struct lacpdu );
+		}
+		else if ( slow_sub_type == AD_TYPE_MARKER ) {
+			len = sizeof( struct bond_marker );
+		}
+		else return 0u;
+	} else if (skb->protocol == htons(ETH_P_LLDP)) {
+		len = 0u;
+		cur = (u8*)skb_network_header(skb);
+		tlv_type = ntohs(*(__be16*)cur) >> 9u;
+		tlv_length = ntohs(*(__be16*)cur) & 0x1FFu;
+		len += tlv_length;
+		while( tlv_type ) {
+			cur += tlv_length;
+			tlv_type = ntohs(*(__be16*)cur) >> 9u;
+			tlv_length = ntohs(*(__be16*)cur) & 0x1FFu;
+			len += tlv_length;
+		}
+	} else if (skb->protocol == htons(ETH_P_PPP_DISC)) {
+		len = sizeof( struct pppoe_hdr ) + ntohs( pppoe_hdr( skb )->length );
+	} else if (skb->protocol == htons(ETH_P_PPP_SES)) {
+		len = sizeof( struct pppoe_hdr ) + ntohs( pppoe_hdr( skb )->length );
+	} else if (skb->protocol == htons(ETH_P_IBOE)) {
+		len = sizeof( struct ib_grh ) + ntohs( ((struct ib_grh *)skb_network_header(skb))->paylen ) + 4u /* ICRC */;
+	} else {
+		return 0u;
+	}
+	return len;
+}
+
+bool wg_check_packet_length( struct sk_buff *skb,  struct net_device *dev ) {
+	if (unlikely(!(pskb_network_may_pull(skb, sizeof(struct iphdr)) &&
+		       (ip_hdr(skb)->version == 4 ||
+			(ip_hdr(skb)->version == 6 &&
+			 pskb_network_may_pull(skb, sizeof(struct ipv6hdr)))))))
+		return false;
+	return true;
+}
+
+bool l2wg_check_packet_length_internal( struct sk_buff *skb, struct net_device *dev, bool wrapped ) {
+	bool valid;
+	u8 slow_sub_type;
+	unsigned int total_len;
+	__be16 vlan_protocol;
+	u8 *cur;
+	unsigned int tlv_type;
+	unsigned int tlv_length;
+	if (skb->protocol == htons(ETH_P_ARP)) {
+		if( unlikely(!(pskb_network_may_pull(skb, sizeof(struct arphdr)))))
+			return false;
+		skb_set_transport_header( skb, ETH_HLEN + sizeof( struct arphdr ) );
+	}
+	else if (skb->protocol == htons(ETH_P_IP)) {
+		if(ip_hdr(skb)->version != 4)
+			return false;
+		if (unlikely(!(pskb_network_may_pull(skb, sizeof(struct iphdr)))))
+			return false;
+		skb_set_transport_header( skb, ETH_HLEN + sizeof( struct iphdr ) );
+	}
+	else if (skb->protocol == htons(ETH_P_IPV6)) {
+		if(ipv6_hdr(skb)->version != 6)
+			return false;
+		if (unlikely(!(pskb_network_may_pull(skb, sizeof(struct ipv6hdr)))))
+			return false;
+		skb_set_transport_header( skb, ETH_HLEN + sizeof( struct ipv6hdr ) );
+	}
+	else if (skb->protocol == htons(ETH_P_RARP)) {
+		if( unlikely(!(pskb_network_may_pull(skb, sizeof(struct arphdr)))))
+			return false;
+		skb_set_transport_header( skb, ETH_HLEN + sizeof( struct arphdr ) );
+	}
+	else if (skb->protocol == htons(ETH_P_PAUSE)) {
+		if( unlikely(!(pskb_network_may_pull(skb, 4))))
+			return false;
+		skb_set_transport_header( skb, ETH_HLEN + 4 );
+	} else if (skb->protocol == htons(ETH_P_ATALK)) {
+		if( unlikely(!(pskb_network_may_pull(skb, sizeof(struct ddpehdr))) ) )
+			return false;
+		skb_set_transport_header( skb, 0 );
+	} else if (skb->protocol == htons(ETH_P_AARP)) {
+		if( unlikely(!(pskb_network_may_pull(skb, sizeof(struct elapaarp))) ) )
+			return false;
+		skb_set_transport_header( skb, ETH_HLEN );
+	} else if (
+		skb->protocol == htons(ETH_P_8021Q) ||
+		skb->protocol == htons(ETH_P_8021AD) ||
+		skb->protocol == htons(ETH_P_QINQ1) ||
+		skb->protocol == htons(ETH_P_QINQ2) ||
+		skb->protocol == htons(ETH_P_QINQ3)
+	) {
+		if( unlikely(!(pskb_network_may_pull(skb, sizeof(struct vlan_hdr))) ) )
+			return false;
+		vlan_protocol = skb->protocol;
+		skb->protocol = ((struct vlan_hdr*)skb_network_header( skb ))->h_vlan_encapsulated_proto;
+		skb->network_header += sizeof( struct vlan_hdr );
+		skb->data += sizeof( struct vlan_hdr );
+		skb->len -= sizeof( struct vlan_hdr );
+		valid = l2wg_check_packet_length_internal( skb, dev, true );
+		skb->network_header -= sizeof( struct vlan_hdr );
+		skb->data -= sizeof( struct vlan_hdr );
+		skb->len += sizeof( struct vlan_hdr );
+		skb->protocol = vlan_protocol;
+		if( !wrapped )
+			skb_set_transport_header( skb, ETH_HLEN );
+		return valid;
+	} else if ( skb->protocol == htons(ETH_P_8021AH) ) {
+		if( unlikely(!(pskb_network_may_pull(skb, sizeof( struct ieee8021ah_hdr ) )) ) )
+			return false;
+		vlan_protocol = skb->protocol;
+		skb->protocol = ((struct ieee8021ah_hdr*)skb_network_header( skb ))->h_proto;
+		skb->network_header += sizeof( struct ieee8021ah_hdr );
+		skb->data += sizeof( struct ieee8021ah_hdr );
+		skb->len -= sizeof( struct ieee8021ah_hdr );
+		valid = l2wg_check_packet_length_internal( skb, dev, true );
+		skb->network_header -= sizeof( struct ieee8021ah_hdr );
+		skb->data -= sizeof( struct ieee8021ah_hdr );
+		skb->len += sizeof( struct ieee8021ah_hdr );
+		skb->protocol = vlan_protocol;
+		if( !wrapped )
+			skb_set_transport_header( skb, ETH_HLEN );
+		return valid;
+	}
+	else if (skb->protocol == htons(ETH_P_X25)) {
+		/* 
+		 * Since X.25 header doesn't containl packet length,
+		 * it is impossible to detect original packet length.
+		 */
+		return false;
+	} else if (skb->protocol == htons(ETH_P_IPX)) {
+		if( unlikely(!(pskb_network_may_pull(skb, sizeof( struct ipxhdr ) )) ) )
+			return false;
+		skb_set_transport_header( skb, ETH_HLEN + sizeof( struct ipxhdr ) );
+	} else if( skb->protocol == htons(ETH_P_802_2) ) {
+		if( wrapped ) return false;
+		if( unlikely(!(pskb_network_may_pull(skb, sizeof( struct llc_hdr ) )) ) )
+			return false;
+		if(
+		  ((struct llc_hdr*)skb_network_header( skb ))->dsap == 0xaa &&
+		  ((struct llc_hdr*)skb_network_header( skb ))->ssap == 0xaa &&
+		  ((struct llc_hdr*)skb_network_header( skb ))->type == 0x03
+		) {
+			if( unlikely(!(pskb_network_may_pull(skb, sizeof( struct snap_hdr ) )) ) )
+				return false;
+			vlan_protocol = skb->protocol;
+			skb->protocol = ((struct snap_hdr*)skb_network_header( skb ))->h_proto;
+			skb->network_header += sizeof( struct snap_hdr );
+			skb->data += sizeof( struct snap_hdr );
+			skb->len -= sizeof( struct snap_hdr );
+			valid = l2wg_check_packet_length_internal( skb, dev, true );
+			skb->network_header -= sizeof( struct snap_hdr );
+			skb->data -= sizeof( struct snap_hdr );
+			skb->len += sizeof( struct snap_hdr );
+			skb->protocol = vlan_protocol;
+			skb_set_transport_header( skb, ETH_HLEN );
+			return valid;
+		}
+		else return false;
+	} else if (skb->protocol == htons(ETH_P_SLOW)) {
+		if( unlikely(!(pskb_network_may_pull(skb, 1u)) ) )
+			return false;
+		slow_sub_type = *(u8*)skb_network_header(skb);
+		if ( slow_sub_type == AD_TYPE_LACPDU ) {
+			if( unlikely(!(pskb_network_may_pull(skb, sizeof(struct lacpdu))) ) )
+				return false;
+			skb_set_transport_header( skb, ETH_HLEN );
+		}
+		else if ( slow_sub_type == AD_TYPE_MARKER ) {
+			if( unlikely(!(pskb_network_may_pull(skb, sizeof(struct bond_marker))) ) )
+				return false;
+			skb_set_transport_header( skb, ETH_HLEN );
+		}
+		else return false;
+		skb_set_transport_header( skb, ETH_HLEN );
+	} else if (skb->protocol == htons(ETH_P_LLDP)) {
+		total_len = 0u;
+		cur = (u8*)skb_network_header(skb);
+		if( unlikely(!(pskb_network_may_pull(skb, 2u )) ) )
+			return false;
+		tlv_type = ntohs(*(__be16*)cur) >> 9u;
+		tlv_length = ntohs(*(__be16*)cur) & 0x1FFu;
+		total_len += tlv_length;
+		while( tlv_type ) {
+			cur += tlv_length;
+			if( unlikely(!(pskb_network_may_pull(skb, total_len + 2u )) ) )
+				return false;
+			tlv_type = ntohs(*(__be16*)cur) >> 9u;
+			tlv_length = ntohs(*(__be16*)cur) & 0x1FFu;
+			total_len += tlv_length;
+		}
+		if( unlikely(!(pskb_network_may_pull(skb, total_len )) ) )
+			return false;
+		skb_set_transport_header( skb, ETH_HLEN );
+		return true;
+	} else if (skb->protocol == htons(ETH_P_PPP_DISC)) {
+		if(unlikely(!(pskb_network_may_pull(skb, sizeof(struct pppoe_hdr)))))
+			return false;
+		skb_set_transport_header( skb, ETH_HLEN + sizeof(struct pppoe_hdr));
+	} else if (skb->protocol == htons(ETH_P_PPP_SES)) {
+		if(unlikely(!(pskb_network_may_pull(skb, sizeof(struct pppoe_hdr)))))
+			return false;
+		skb_set_transport_header( skb, ETH_HLEN + sizeof(struct pppoe_hdr));
+	} else if (skb->protocol == htons(ETH_P_IBOE)) {
+		if(unlikely(!(pskb_network_may_pull(skb, sizeof(struct ib_grh)))))
+			return false;
+		skb_set_transport_header( skb, ETH_HLEN );
+	} else return false;
+	return true;
+}
+
+bool l2wg_check_packet_length( struct sk_buff *skb, struct net_device *dev ) {
+	skb_reset_mac_header( skb );
+	skb_set_network_header( skb, ETH_HLEN );
+	skb->protocol = eth_type_trans( skb, dev );
+	return l2wg_check_packet_length_internal( skb, dev, false );
+}
+
 static void wg_packet_consume_data_done(struct wg_peer *peer,
 					struct sk_buff *skb,
 					struct endpoint *endpoint)
 {
 	struct net_device *dev = peer->device->dev;
+	struct wg_device *wg = netdev_priv(dev);
 	unsigned int len, len_before_trim;
 	struct wg_peer *routed_peer;
 
@@ -369,13 +718,9 @@ static void wg_packet_consume_data_done(struct wg_peer *peer,
 	}
 
 	wg_timers_data_received(peer);
-
 	if (unlikely(skb_network_header(skb) < skb->head))
 		goto dishonest_packet_size;
-	if (unlikely(!(pskb_network_may_pull(skb, sizeof(struct iphdr)) &&
-		       (ip_hdr(skb)->version == 4 ||
-			(ip_hdr(skb)->version == 6 &&
-			 pskb_network_may_pull(skb, sizeof(struct ipv6hdr)))))))
+	if( unlikely(!wg->check_packet_length( skb, dev )) )
 		goto dishonest_packet_type;
 
 	skb->dev = dev;
@@ -387,19 +732,9 @@ static void wg_packet_consume_data_done(struct wg_peer *peer,
 	 */
 	skb->ip_summed = CHECKSUM_UNNECESSARY;
 	skb->csum_level = ~0; /* All levels */
-	skb->protocol = ip_tunnel_parse_protocol(skb);
-	if (skb->protocol == htons(ETH_P_IP)) {
-		len = ntohs(ip_hdr(skb)->tot_len);
-		if (unlikely(len < sizeof(struct iphdr)))
-			goto dishonest_packet_size;
-		INET_ECN_decapsulate(skb, PACKET_CB(skb)->ds, ip_hdr(skb)->tos);
-	} else if (skb->protocol == htons(ETH_P_IPV6)) {
-		len = ntohs(ipv6_hdr(skb)->payload_len) +
-		      sizeof(struct ipv6hdr);
-		INET_ECN_decapsulate(skb, PACKET_CB(skb)->ds, ipv6_get_dsfield(ipv6_hdr(skb)));
-	} else {
-		goto dishonest_packet_type;
-	}
+	len = wg->get_packet_length(skb);
+	if( !len )
+		goto packet_processed;
 
 	if (unlikely(len > skb->len))
 		goto dishonest_packet_size;
@@ -407,13 +742,18 @@ static void wg_packet_consume_data_done(struct wg_peer *peer,
 	if (unlikely(pskb_trim(skb, len)))
 		goto packet_processed;
 
-	routed_peer = wg_allowedips_lookup_src(&peer->device->peer_allowedips,
+	routed_peer = wg->allowedips_lookup_src(&peer->device->peer_allowedips,
 					       skb);
 	wg_peer_put(routed_peer); /* We don't need the extra reference. */
 
 	if (unlikely(routed_peer != peer))
 		goto dishonest_packet_peer;
 
+	if( unlikely( skb->len < ETH_ZLEN && wg->l2 ) ) {
+		skb_push( skb, ETH_HLEN );
+		eth_skb_pad( skb );
+		skb_pull( skb, ETH_HLEN );
+	}
 	napi_gro_receive(&peer->napi, skb);
 	update_rx_stats(peer, message_data_len(len_before_trim));
 	return;
